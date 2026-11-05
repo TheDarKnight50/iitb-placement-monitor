@@ -1,0 +1,17 @@
+# Secrets and credentials
+credentials.json
+google_token.json
+token.txt
+config.env
+.env
+
+# Cache and local runtime files
+known_jobs.json
+known_blogs.json
+monitor.log
+chrome_data/
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
