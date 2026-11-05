@@ -205,14 +205,21 @@ def fetch_jobs_data(token):
         raise RuntimeError(f"Failed to fetch jobs API: {r_jobs.status_code} {r_jobs.text}")
     all_jobs = r_jobs.json()
     
+    # Sort chronologically by opensAt descending (newest jobs first)
+    all_jobs = sorted(all_jobs, key=lambda x: x.get("opensAt") or "", reverse=True)
+    
     signed_job_ids = set()
+    signed_apps_map = {}
     if applicant_id:
         try:
             r_apps = requests.get(f"{BASE_API}/job/application", headers=headers, params={"applicantId": applicant_id}, timeout=20)
             if r_apps.status_code == 200:
                 apps = r_apps.json()
                 for app in apps:
-                    signed_job_ids.add(app.get("jobId") or (app.get("job", {}).get("id")))
+                    jid = app.get("jobId") or (app.get("job", {}).get("id"))
+                    if jid:
+                        signed_job_ids.add(jid)
+                        signed_apps_map[jid] = app
         except Exception as e:
             print(f"[!] Warning fetching job applications: {e}")
 
@@ -279,6 +286,7 @@ def fetch_jobs_data(token):
             pay_str = "N/A"
 
         has_signed = job_id in signed_job_ids
+        signed_at_time = signed_apps_map.get(job_id, {}).get("createdAt", "")
 
         processed_jobs.append({
             "id": job_id,
@@ -286,6 +294,8 @@ def fetch_jobs_data(token):
             "role": title,
             "pay": pay_str,
             "last_day": last_day_str,
+            "opens_at": j.get("opensAt", ""),
+            "signed_at": signed_at_time,
             "eligible": "Eligible" if is_eligible else "Not Eligible",
             "signed": "Yes" if has_signed else "No"
         })
@@ -412,8 +422,11 @@ def update_google_sheet(jobs):
     apply_sheet_formatting_and_colors(sh, ws_all, len(rows_all))
     print(f"[+] '{SHEET_ALL_JOBS}' updated with {len(jobs)} jobs.")
 
-    # 2. Update Separate 'Signed JAFs' Sheet
+    # 2. Update Separate 'Signed JAFs' Sheet (sorted by signed time descending)
     signed_jobs = [j for j in jobs if j["signed"] == "Yes"]
+    # Sort signed jobs by when they were signed if available, else by opensAt
+    signed_jobs.sort(key=lambda x: x.get("signed_at") or x.get("opens_at") or "", reverse=True)
+    
     try:
         ws_signed = sh.worksheet(SHEET_SIGNED_JOBS)
     except Exception:
