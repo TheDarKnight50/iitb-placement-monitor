@@ -314,46 +314,10 @@ def fetch_jobs_data(token):
 
 def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
     """
-    Applies whole-row conditional formatting:
-    - Entire Row Clean Mint Green if Eligible ($F2 = "Eligible")
-    - Entire Row Clean Soft Rose Red if Not Eligible ($F2 = "Not Eligible")
-    - Signed column "Yes" highlighted in bold royal blue
-    - Navy blue header
+    Applies whole-row conditional formatting on a freshly created sheet.
+    Sheet is always recreated before this is called - no cleanup needed.
     """
     sheet_id = worksheet.id
-    
-    # 1a. Clear any old conditional formatting rules on this sheet to avoid duplicates
-    try:
-        sheet_meta = sh.fetch_sheet_metadata()
-        for s in sheet_meta.get("sheets", []):
-            if s["properties"]["sheetId"] == sheet_id:
-                rules = s.get("conditionalFormats", [])
-                del_reqs = [{"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": i}} for i in range(len(rules) - 1, -1, -1)]
-                if del_reqs:
-                    sh.batch_update({"requests": del_reqs})
-                break
-    except Exception as e:
-        print(f"[!] Warning clearing old conditional format rules: {e}")
-
-    # 1b. Clear ALL data validation from every cell (removes any residual dropdowns)
-    # Using repeatCell with fields="dataValidation" is the correct way - setDataValidation
-    # with rule=None gets stripped by gspread before the API call.
-    try:
-        sh.batch_update({"requests": [{
-            "repeatCell": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": 0,
-                    "endRowIndex": max(num_rows + 50, 500),
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 10
-                },
-                "cell": {},
-                "fields": "dataValidation"
-            }
-        }]})
-    except Exception as e:
-        print(f"[!] Warning clearing data validation: {e}")
 
     # Now add clean rules (Column F is index 5: "Eligible or Not", Column G is index 6: "Have I Signed")
     rules = [
@@ -452,45 +416,35 @@ def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
     except Exception as e:
         print(f"[!] Warning applying styles: {e}")
 
+
 def update_google_sheet(jobs):
-    """Updates 'All Jobs' and creates/updates a separate 'Signed JAFs' worksheet."""
+    """Updates 'All Jobs' and 'Signed JAFs' by clearing and rewriting data each run."""
     gc = get_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    # 1. Update All Jobs Sheet
+    headers = ["Sr No", "Company Name", "Roles", "Base Pay (INR)", "CTC (INR)", "Eligible or Not", "Have I Signed", "Last Date to Sign"]
+
+    # 1. Update All Jobs sheet
     try:
         ws_all = sh.worksheet(SHEET_ALL_JOBS)
     except Exception:
-        try:
-            ws_all = sh.worksheet("Sheet1")
-            ws_all.update_title(SHEET_ALL_JOBS)
-        except Exception:
-            ws_all = sh.add_worksheet(title=SHEET_ALL_JOBS, rows="500", cols="10")
+        ws_all = sh.add_worksheet(title=SHEET_ALL_JOBS, rows="500", cols="10")
 
-    headers = ["Sr No", "Company Name", "Roles", "Base Pay (INR)", "CTC (INR)", "Eligible or Not", "Have I Signed", "Last Date to Sign"]
-    
     rows_all = [headers]
     for idx, j in enumerate(jobs, start=1):
-        rows_all.append([
-            idx,
-            j["company"],
-            j["role"],
-            j["base_pay"],
-            j["ctc"],
-            j["eligible"],
-            j["signed"],
-            j["last_day"]
-        ])
+        rows_all.append([idx, j["company"], j["role"], j["base_pay"], j["ctc"], j["eligible"], j["signed"], j["last_day"]])
 
     ws_all.clear()
     ws_all.update(values=rows_all, range_name="A1")
     apply_sheet_formatting_and_colors(sh, ws_all, len(rows_all))
     print(f"[+] '{SHEET_ALL_JOBS}' updated with {len(jobs)} jobs.")
 
-    # 2. Update Separate 'Signed JAFs' Sheet (sorted by signed time descending)
-    signed_jobs = [j for j in jobs if j["signed"] == "Yes"]
-    signed_jobs.sort(key=lambda x: x.get("signed_at") or x.get("opens_at") or "", reverse=True)
-    
+    # 2. Update Signed JAFs sheet
+    signed_jobs = sorted(
+        [j for j in jobs if j["signed"] == "Yes"],
+        key=lambda x: x.get("signed_at") or x.get("opens_at") or "",
+        reverse=True
+    )
     try:
         ws_signed = sh.worksheet(SHEET_SIGNED_JOBS)
     except Exception:
@@ -498,16 +452,7 @@ def update_google_sheet(jobs):
 
     rows_signed = [headers]
     for idx, j in enumerate(signed_jobs, start=1):
-        rows_signed.append([
-            idx,
-            j["company"],
-            j["role"],
-            j["base_pay"],
-            j["ctc"],
-            j["eligible"],
-            j["signed"],
-            j["last_day"]
-        ])
+        rows_signed.append([idx, j["company"], j["role"], j["base_pay"], j["ctc"], j["eligible"], j["signed"], j["last_day"]])
 
     ws_signed.clear()
     ws_signed.update(values=rows_signed, range_name="A1")
