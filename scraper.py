@@ -162,7 +162,7 @@ def convert_to_inr_formatted(amount, currency):
         inr_val = amt * rate
         
         if cur != "INR":
-            return f"{format_inr(inr_val)} (converted from {cur} {int(amt):,})"
+            return f"{format_inr(inr_val)} ({cur} {int(amt):,})"
         return format_inr(inr_val)
     except Exception:
         return "N/A"
@@ -180,7 +180,7 @@ def fetch_single_job_salary(args):
     return job_id, [], "INR"
 
 def fetch_jobs_data(token):
-    """Fetches jobs, resolves B.Tech salary in INR, eligibility, and signed status."""
+    """Fetches jobs, resolves B.Tech Base Pay & CTC in INR, eligibility, and signed status."""
     headers = {"Authorization": f"Bearer {token}"}
     payload = parse_jwt(token)
     
@@ -254,36 +254,42 @@ def fetch_jobs_data(token):
         company_name = j.get("company", {}).get("name", "Unknown Company")
         title = j.get("title", "Unknown Role")
         
-        # Clean date format: e.g. "26th Oct"
         last_day_str = format_date_clean(j.get("closesAt"))
 
-        # Check eligibility first
         elig_info = eligibility_map.get(job_id)
         is_eligible = elig_info.get("eligible", False) if elig_info else bool(j.get("eligible", False))
 
         salaries, currency = job_salary_map.get(job_id, ([], "INR"))
-        pay_str = "N/A"
+        base_pay_str = "N/A"
+        ctc_str = "N/A"
         
-        # If ineligible or no salary, B.Tech pay is N/A
+        # If eligible, extract Base Pay and CTC for B.Tech
         if is_eligible and salaries:
-            # Find salary entry for B.Tech
             btech_sals = [s for s in salaries if s.get("programId") == btech_prog_id]
             if not btech_sals:
-                # If not specifically tagged program 1, fallback to common salary entry
                 btech_sals = salaries
                 
-            parts = []
+            base_parts = []
+            ctc_parts = []
             for s in btech_sals:
-                raw_amt = s.get("ctc") or s.get("amount")
-                if raw_amt and float(raw_amt) > 0:
-                    formatted = convert_to_inr_formatted(raw_amt, currency)
-                    if formatted != "N/A":
-                        parts.append(formatted)
+                raw_base = s.get("amount")
+                raw_ctc = s.get("ctc")
+                
+                if raw_base and float(raw_base) > 0:
+                    formatted_base = convert_to_inr_formatted(raw_base, currency)
+                    if formatted_base != "N/A":
+                        base_parts.append(formatted_base)
                         
-            parts = list(dict.fromkeys(parts))
-            pay_str = "; ".join(parts) if parts else "N/A"
-        else:
-            pay_str = "N/A"
+                if raw_ctc and float(raw_ctc) > 0:
+                    formatted_ctc = convert_to_inr_formatted(raw_ctc, currency)
+                    if formatted_ctc != "N/A":
+                        ctc_parts.append(formatted_ctc)
+                        
+            base_parts = list(dict.fromkeys(base_parts))
+            ctc_parts = list(dict.fromkeys(ctc_parts))
+            
+            base_pay_str = "; ".join(base_parts) if base_parts else "N/A"
+            ctc_str = "; ".join(ctc_parts) if ctc_parts else "N/A"
 
         has_signed = job_id in signed_job_ids
         signed_at_time = signed_apps_map.get(job_id, {}).get("createdAt", "")
@@ -292,7 +298,8 @@ def fetch_jobs_data(token):
             "id": job_id,
             "company": company_name,
             "role": title,
-            "pay": pay_str,
+            "base_pay": base_pay_str,
+            "ctc": ctc_str,
             "last_day": last_day_str,
             "opens_at": j.get("opensAt", ""),
             "signed_at": signed_at_time,
@@ -303,9 +310,29 @@ def fetch_jobs_data(token):
     return processed_jobs
 
 def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
-    """Applies whole-row coloring based on eligibility and clean header styles."""
+    """
+    Applies whole-row conditional formatting:
+    - Entire Row Clean Mint Green if Eligible ($F2 = "Eligible")
+    - Entire Row Clean Soft Rose Red if Not Eligible ($F2 = "Not Eligible")
+    - Signed column "Yes" highlighted in bold royal blue
+    - Navy blue header
+    """
     sheet_id = worksheet.id
     
+    # 1. Clear any old conditional formatting rules on this sheet to avoid duplicates
+    try:
+        sheet_meta = sh.fetch_sheet_metadata()
+        for s in sheet_meta.get("sheets", []):
+            if s["properties"]["sheetId"] == sheet_id:
+                rules = s.get("conditionalFormats", [])
+                del_reqs = [{"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": i}} for i in range(len(rules) - 1, -1, -1)]
+                if del_reqs:
+                    sh.batch_update({"requests": del_reqs})
+                break
+    except Exception as e:
+        print(f"[!] Warning clearing old rules: {e}")
+
+    # Now add clean rules (Column F is index 5: "Eligible or Not", Column G is index 6: "Have I Signed")
     rules = [
         # 1. Header row design
         {
@@ -313,7 +340,7 @@ def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
                 "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
                 "cell": {
                     "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.15, "green": 0.25, "blue": 0.42},
+                        "backgroundColor": {"red": 0.12, "green": 0.22, "blue": 0.38},
                         "horizontalAlignment": "CENTER",
                         "textFormat": {"foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "fontSize": 10, "bold": True}
                     }
@@ -321,55 +348,55 @@ def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
                 "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
             }
         },
-        # 2. Entire Row Green if Eligible ($E2 = "Eligible")
+        # 2. Entire Row Green if Eligible ($F2 = "Eligible") -> Distinct Soft Mint Green (#D4EDDA)
         {
             "addConditionalFormatRule": {
                 "rule": {
-                    "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": num_rows, "startColumnIndex": 0, "endColumnIndex": 7}],
+                    "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": num_rows, "startColumnIndex": 0, "endColumnIndex": 8}],
                     "booleanRule": {
                         "condition": {
                             "type": "CUSTOM_FORMULA",
-                            "values": [{"userEnteredValue": '=$E2="Eligible"'}]
+                            "values": [{"userEnteredValue": '=$F2="Eligible"'}]
                         },
                         "format": {
-                            "backgroundColor": {"red": 0.90, "green": 0.96, "blue": 0.90}
+                            "backgroundColor": {"red": 0.83, "green": 0.93, "blue": 0.85}
                         }
                     }
                 },
                 "index": 0
             }
         },
-        # 3. Entire Row Light Red/Pink if Not Eligible ($E2 = "Not Eligible")
+        # 3. Entire Row Red if Not Eligible ($F2 = "Not Eligible") -> Distinct Soft Rose Red (#F8D7DA)
         {
             "addConditionalFormatRule": {
                 "rule": {
-                    "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": num_rows, "startColumnIndex": 0, "endColumnIndex": 7}],
+                    "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": num_rows, "startColumnIndex": 0, "endColumnIndex": 8}],
                     "booleanRule": {
                         "condition": {
                             "type": "CUSTOM_FORMULA",
-                            "values": [{"userEnteredValue": '=$E2="Not Eligible"'}]
+                            "values": [{"userEnteredValue": '=$F2="Not Eligible"'}]
                         },
                         "format": {
-                            "backgroundColor": {"red": 0.99, "green": 0.92, "blue": 0.92}
+                            "backgroundColor": {"red": 0.97, "green": 0.84, "blue": 0.85}
                         }
                     }
                 },
                 "index": 1
             }
         },
-        # 4. Highlight Signed column "Yes" with bold blue
+        # 4. Highlight Signed column "Yes" with bold blue badge (#CCE5FF)
         {
             "addConditionalFormatRule": {
                 "rule": {
-                    "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": num_rows, "startColumnIndex": 5, "endColumnIndex": 6}],
+                    "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": num_rows, "startColumnIndex": 6, "endColumnIndex": 7}],
                     "booleanRule": {
                         "condition": {
                             "type": "TEXT_EQ",
                             "values": [{"userEnteredValue": "Yes"}]
                         },
                         "format": {
-                            "backgroundColor": {"red": 0.78, "green": 0.88, "blue": 1.0},
-                            "textFormat": {"foregroundColor": {"red": 0.05, "green": 0.30, "blue": 0.75}, "bold": True}
+                            "backgroundColor": {"red": 0.75, "green": 0.88, "blue": 1.0},
+                            "textFormat": {"foregroundColor": {"red": 0.05, "green": 0.28, "blue": 0.70}, "bold": True}
                         }
                     }
                 },
@@ -379,7 +406,7 @@ def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
         # 5. Auto resize columns
         {
             "autoResizeDimensions": {
-                "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 7}
+                "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 8}
             }
         }
     ]
@@ -403,7 +430,7 @@ def update_google_sheet(jobs):
         except Exception:
             ws_all = sh.add_worksheet(title=SHEET_ALL_JOBS, rows="500", cols="10")
 
-    headers = ["Sr No", "Company Name", "Roles", "Pay (B.Tech in INR)", "Eligible or Not", "Have I Signed", "Last Date to Sign"]
+    headers = ["Sr No", "Company Name", "Roles", "Base Pay (INR)", "CTC (INR)", "Eligible or Not", "Have I Signed", "Last Date to Sign"]
     
     rows_all = [headers]
     for idx, j in enumerate(jobs, start=1):
@@ -411,7 +438,8 @@ def update_google_sheet(jobs):
             idx,
             j["company"],
             j["role"],
-            j["pay"],
+            j["base_pay"],
+            j["ctc"],
             j["eligible"],
             j["signed"],
             j["last_day"]
@@ -424,7 +452,6 @@ def update_google_sheet(jobs):
 
     # 2. Update Separate 'Signed JAFs' Sheet (sorted by signed time descending)
     signed_jobs = [j for j in jobs if j["signed"] == "Yes"]
-    # Sort signed jobs by when they were signed if available, else by opensAt
     signed_jobs.sort(key=lambda x: x.get("signed_at") or x.get("opens_at") or "", reverse=True)
     
     try:
@@ -438,7 +465,8 @@ def update_google_sheet(jobs):
             idx,
             j["company"],
             j["role"],
-            j["pay"],
+            j["base_pay"],
+            j["ctc"],
             j["eligible"],
             j["signed"],
             j["last_day"]
@@ -477,7 +505,7 @@ def check_jobs():
     if new_jobs:
         msg = f"Found {len(new_jobs)} new job(s):\n"
         for nj in new_jobs[:5]:
-            msg += f"• {nj['company']} - {nj['role']} (Pay: {nj['pay']}) [{nj['eligible']}]\n"
+            msg += f"• {nj['company']} - {nj['role']} (Base: {nj['base_pay']} | CTC: {nj['ctc']}) [{nj['eligible']}]\n"
         if len(new_jobs) > 5:
             msg += f"...and {len(new_jobs) - 5} more."
         send_notifications("New Placement Job Alert!", msg, DISCORD_WEBHOOK_URL)
