@@ -322,7 +322,7 @@ def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
     """
     sheet_id = worksheet.id
     
-    # 1. Clear any old conditional formatting rules on this sheet to avoid duplicates
+    # 1a. Clear any old conditional formatting rules on this sheet to avoid duplicates
     try:
         sheet_meta = sh.fetch_sheet_metadata()
         for s in sheet_meta.get("sheets", []):
@@ -333,7 +333,24 @@ def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
                     sh.batch_update({"requests": del_reqs})
                 break
     except Exception as e:
-        print(f"[!] Warning clearing old rules: {e}")
+        print(f"[!] Warning clearing old conditional format rules: {e}")
+
+    # 1b. Clear ALL data validation from every cell (removes any residual dropdowns)
+    try:
+        sh.batch_update({"requests": [{
+            "setDataValidation": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": max(num_rows + 10, 500),
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 10
+                },
+                "rule": None  # None = clear all validation on this range
+            }
+        }]})
+    except Exception as e:
+        print(f"[!] Warning clearing data validation: {e}")
 
     # Now add clean rules (Column F is index 5: "Eligible or Not", Column G is index 6: "Have I Signed")
     rules = [
