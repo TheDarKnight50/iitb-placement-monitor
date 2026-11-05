@@ -336,17 +336,20 @@ def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
         print(f"[!] Warning clearing old conditional format rules: {e}")
 
     # 1b. Clear ALL data validation from every cell (removes any residual dropdowns)
+    # Using repeatCell with fields="dataValidation" is the correct way - setDataValidation
+    # with rule=None gets stripped by gspread before the API call.
     try:
         sh.batch_update({"requests": [{
-            "setDataValidation": {
+            "repeatCell": {
                 "range": {
                     "sheetId": sheet_id,
                     "startRowIndex": 0,
-                    "endRowIndex": max(num_rows + 10, 500),
+                    "endRowIndex": max(num_rows + 50, 500),
                     "startColumnIndex": 0,
                     "endColumnIndex": 10
                 },
-                "rule": None  # None = clear all validation on this range
+                "cell": {},
+                "fields": "dataValidation"
             }
         }]})
     except Exception as e:
