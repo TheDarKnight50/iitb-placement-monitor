@@ -259,37 +259,40 @@ def fetch_jobs_data(token):
         elig_info = eligibility_map.get(job_id)
         is_eligible = elig_info.get("eligible", False) if elig_info else bool(j.get("eligible", False))
 
+        # Salary resolution
         salaries, currency = job_salary_map.get(job_id, ([], "INR"))
         base_pay_str = "N/A"
         ctc_str = "N/A"
         
-        # If eligible, extract Base Pay and CTC for B.Tech
-        if is_eligible and salaries:
-            btech_sals = [s for s in salaries if s.get("programId") == btech_prog_id]
-            if not btech_sals:
-                btech_sals = salaries
-                
-            base_parts = []
-            ctc_parts = []
-            for s in btech_sals:
-                raw_base = s.get("amount")
-                raw_ctc = s.get("ctc")
-                
-                if raw_base and float(raw_base) > 0:
-                    formatted_base = convert_to_inr_formatted(raw_base, currency)
-                    if formatted_base != "N/A":
-                        base_parts.append(formatted_base)
-                        
-                if raw_ctc and float(raw_ctc) > 0:
-                    formatted_ctc = convert_to_inr_formatted(raw_ctc, currency)
-                    if formatted_ctc != "N/A":
-                        ctc_parts.append(formatted_ctc)
-                        
-            base_parts = list(dict.fromkeys(base_parts))
-            ctc_parts = list(dict.fromkeys(ctc_parts))
-            
-            base_pay_str = "; ".join(base_parts) if base_parts else "N/A"
-            ctc_str = "; ".join(ctc_parts) if ctc_parts else "N/A"
+        if salaries:
+            if is_eligible:
+                # 1. If eligible, find exact B.Tech program salary entry
+                btech_sals = [s for s in salaries if s.get("programId") == btech_prog_id]
+                chosen_sals = btech_sals if btech_sals else salaries
+
+                # For eligible jobs, collapse multiple options → pick the highest CTC as single value
+                best_sal = max(chosen_sals, key=lambda s: float(s.get("ctc") or s.get("amount") or 0))
+                raw_base = best_sal.get("amount")
+                raw_ctc  = best_sal.get("ctc")
+
+                base_pay_str = convert_to_inr_formatted(raw_base, currency) if raw_base and float(raw_base) > 0 else "N/A"
+                ctc_str      = convert_to_inr_formatted(raw_ctc,  currency) if raw_ctc  and float(raw_ctc)  > 0 else base_pay_str
+            else:
+                # 2. If ineligible, find the HIGHEST paying salary offer across ALL programs
+                best_sal = max(salaries, key=lambda s: float(s.get("ctc") or s.get("amount") or 0))
+                raw_base = best_sal.get("amount")
+                raw_ctc  = best_sal.get("ctc")
+
+                base_pay_str = convert_to_inr_formatted(raw_base, currency) if raw_base and float(raw_base) > 0 else "N/A"
+                ctc_str      = convert_to_inr_formatted(raw_ctc,  currency) if raw_ctc  and float(raw_ctc)  > 0 else base_pay_str
+                # Last resort fallback: if still N/A, use whatever non-zero field exists
+                if ctc_str == "N/A" and base_pay_str == "N/A":
+                    for s in sorted(salaries, key=lambda s: float(s.get("ctc") or s.get("amount") or 0), reverse=True):
+                        amt = s.get("ctc") or s.get("amount")
+                        if amt and float(amt) > 0:
+                            ctc_str = convert_to_inr_formatted(amt, currency)
+                            base_pay_str = ctc_str
+                            break
 
         has_signed = job_id in signed_job_ids
         signed_at_time = signed_apps_map.get(job_id, {}).get("createdAt", "")
@@ -403,10 +406,24 @@ def apply_sheet_formatting_and_colors(sh, worksheet, num_rows):
                 "index": 2
             }
         },
-        # 5. Auto resize columns
+        # 5. Column sizing: sensible fixed width for 'Roles' (col index 2), auto for rest
         {
             "autoResizeDimensions": {
                 "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 8}
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 2,
+                    "endIndex": 3
+                },
+                "properties": {
+                    "pixelSize": 180
+                },
+                "fields": "pixelSize"
             }
         }
     ]
