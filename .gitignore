@@ -2,12 +2,14 @@
 credentials.json
 google_token.json
 token.txt
+insti_token.txt
 config.env
 .env
 
 # Cache and local runtime files
 known_jobs.json
 known_blogs.json
+tests.json
 monitor.log
 chrome_data/
 __pycache__/

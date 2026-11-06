@@ -73,10 +73,31 @@ def parse_jwt(token_str):
         print(f"[!] Error decoding JWT: {e}")
     return {}
 
-def send_notifications(title, message, discord_webhook_url=None):
+def send_discord_embed(webhook_url, title, description, color=3447003):
+    """Posts a single embed to a Discord webhook. Returns True on success."""
+    if not webhook_url or not webhook_url.strip():
+        return False
+    try:
+        payload = {
+            "embeds": [{
+                "title": title[:256],
+                "description": description[:4000],
+                "color": color
+            }]
+        }
+        r = requests.post(webhook_url, json=payload, timeout=10)
+        if r.status_code not in (200, 204):
+            print(f"[!] Discord webhook returned {r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[!] Discord notification error: {e}")
+        return False
+
+def send_notifications(title, message, discord_webhook_url=None, color=3447003):
     """Sends desktop notification and Discord webhook if configured."""
     print(f"[NOTIFICATION] {title}: {message}")
-    
+
     # 1. Desktop notification via notify-send
     try:
         os.system(f'notify-send "{title}" "{message}"')
@@ -84,15 +105,4 @@ def send_notifications(title, message, discord_webhook_url=None):
         print(f"[!] notify-send error: {e}")
 
     # 2. Discord Webhook
-    if discord_webhook_url and discord_webhook_url.strip():
-        try:
-            payload = {
-                "embeds": [{
-                    "title": title,
-                    "description": message,
-                    "color": 3447003
-                }]
-            }
-            requests.post(discord_webhook_url, json=payload, timeout=10)
-        except Exception as e:
-            print(f"[!] Discord notification error: {e}")
+    send_discord_embed(discord_webhook_url, title, message, color)

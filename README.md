@@ -17,11 +17,14 @@ An automated monitoring suite for the IIT Bombay campus placement portal and pla
    - **`All Jobs` tab**: Full list of placement openings with whole-row conditional colors (Soft Green for **Eligible**, Soft Red for **Not Eligible**).
    - **`Signed JAFs` tab**: Dedicated sheet showing exclusively the JAFs you have signed.
    - Simplified date formatting for deadlines (e.g., `26th Oct`, `31st Oct`).
-4. **Placement Blog Alerts**:
-   - Monitors `https://campus.placements.iitb.ac.in/blog/placement/` for newly posted announcements.
-5. **Instant Terminal Trigger (`fetch-placement`)**:
+4. **Placement Blog & Test Alerts**:
+   - Monitors the placement blog via the public InstiApp mirror (`gymkhana.iitb.ac.in/instiapp`) - no SSO login required.
+   - Test-related posts are routed to a dedicated Discord channel, with test date/time auto-parsed from the post text.
+5. **Test Reminders for Signed JAFs**:
+   - Tests are stored locally, matched against your signed JAFs, and you get 2 reminders on Discord: 1 hour and 30 minutes before each test.
+6. **Instant Terminal Trigger (`fetch-placement`)**:
    - Update your sheet and check for alerts anytime on demand with a single short command.
-6. **Zero-Window Background Daemon**:
+7. **Zero-Window Background Daemon**:
    - Runs silently via `systemd` user service without popping up browser windows or interrupting your workflow.
 
 ---
@@ -32,13 +35,15 @@ An automated monitoring suite for the IIT Bombay campus placement portal and pla
 ├── common.py             # Shared utilities (Google Sheets client, JWT decoding, notifications)
 ├── scraper.py            # Core engine (API scraper, salary extractor, blog checker, sheets updater)
 ├── set_token.py          # Quick setup helper to paste your portal JWT session token
+├── set_insti_token.py    # Setup helper for the InstiApp session (blog/test monitoring)
+├── blog_login.py         # Optional: re-establish portal SSO via browser (for JWT auto-refresh)
 ├── run_monitor.sh        # Background loop runner (every 15 minutes)
 ├── config.env.example    # Configuration template (fill this in as config.env)
 ├── requirements.txt      # Python dependencies
 └── README.md             # Setup guide
 ```
 
-> **Security Note**: All secrets (`credentials.json`, `token.txt`, `config.env`, `chrome_data/`) are strictly git-ignored so your private credentials and tokens are never pushed to version control.
+> **Security Note**: All secrets (`credentials.json`, `token.txt`, `insti_token.txt`, `config.env`, `chrome_data/`) are strictly git-ignored so your private credentials and tokens are never pushed to version control.
 
 ---
 
@@ -104,6 +109,26 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
    python3 set_token.py
    ```
    Paste the token and hit Enter. The token will be safely stored in `token.txt` (git-ignored).
+
+### 4b. Capture InstiApp Session (for blog & test monitoring)
+
+1. Open your normal browser where you are logged into [insti.app](https://www.insti.app/blog/) (the placement blog's public mirror).
+2. Press **F12**, open the **Console** tab, paste and run:
+   ```javascript
+   copy(localStorage.getItem('session_id'))
+   ```
+3. In your terminal, run:
+   ```bash
+   python3 set_insti_token.py
+   ```
+   Paste the value and hit Enter. It will be saved to `insti_token.txt` (git-ignored).
+
+### 4c. Discord Channel Webhooks (Optional)
+
+For per-channel routing (`new-jafs`, `tests`, `reminders`), create one webhook per channel
+(*Edit Channel → Integrations → Webhooks → New Webhook → Copy URL*) and fill in
+`DISCORD_WEBHOOK_NEW_JAFS`, `DISCORD_WEBHOOK_TESTS` and `DISCORD_WEBHOOK_REMINDERS` in `config.env`.
+Any missing webhook falls back to the generic `DISCORD_WEBHOOK_URL`.
 
 ---
 
