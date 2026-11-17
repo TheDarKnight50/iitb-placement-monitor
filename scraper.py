@@ -507,10 +507,26 @@ def check_jobs(token=None):
     current_jobs_map = {str(j["id"]): j for j in jobs}
     
     new_jobs = []
+    updated_jobs = []
     if known_jobs:
         for j_id, j_data in current_jobs_map.items():
             if j_id not in known_jobs:
                 new_jobs.append(j_data)
+            else:
+                old_data = known_jobs[j_id]
+                changes = []
+                if old_data.get("eligible") != j_data.get("eligible"):
+                    changes.append(f"Eligibility: {old_data.get('eligible')} ➔ **{j_data.get('eligible')}**")
+                if old_data.get("last_day") != j_data.get("last_day"):
+                    changes.append(f"Deadline: {old_data.get('last_day')} ➔ **{j_data.get('last_day')}**")
+                if old_data.get("base_pay") != j_data.get("base_pay"):
+                    changes.append(f"Base: {old_data.get('base_pay')} ➔ **{j_data.get('base_pay')}**")
+                if old_data.get("ctc") != j_data.get("ctc"):
+                    changes.append(f"CTC: {old_data.get('ctc')} ➔ **{j_data.get('ctc')}**")
+                if old_data.get("signed") != j_data.get("signed"):
+                    changes.append(f"Signed: {old_data.get('signed')} ➔ **{j_data.get('signed')}**")
+                if changes:
+                    updated_jobs.append((j_data, changes))
                 
     if new_jobs:
         msg = f"Found {len(new_jobs)} new job(s):\n"
@@ -520,6 +536,14 @@ def check_jobs(token=None):
         if len(new_jobs) > 5:
             msg += f"...and {len(new_jobs) - 5} more."
         send_notifications("🆕 New JAF Opening!", msg, DISCORD_WEBHOOK_NEW_JAFS, color=5763719)
+
+    if updated_jobs:
+        msg = f"Detected changes in {len(updated_jobs)} JAF(s):\n"
+        for uj, chgs in updated_jobs[:5]:
+            msg += f"• **{uj['company']}** - {uj['role']}\n  " + " | ".join(chgs) + "\n"
+        if len(updated_jobs) > 5:
+            msg += f"...and {len(updated_jobs) - 5} more updated JAFs."
+        send_notifications("🔄 JAF Updated!", msg, DISCORD_WEBHOOK_NEW_JAFS, color=3447003)
 
     try:
         update_google_sheet(jobs)
