@@ -32,6 +32,8 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 DISCORD_WEBHOOK_NEW_JAFS = os.getenv("DISCORD_WEBHOOK_NEW_JAFS", "").strip() or DISCORD_WEBHOOK_URL
 DISCORD_WEBHOOK_TESTS = os.getenv("DISCORD_WEBHOOK_TESTS", "").strip() or DISCORD_WEBHOOK_URL
 DISCORD_WEBHOOK_REMINDERS = os.getenv("DISCORD_WEBHOOK_REMINDERS", "").strip() or DISCORD_WEBHOOK_URL
+DISCORD_WEBHOOK_FORMS = os.getenv("DISCORD_WEBHOOK_FORMS", "").strip() or DISCORD_WEBHOOK_URL
+DISCORD_WEBHOOK_SHORTLISTS = os.getenv("DISCORD_WEBHOOK_SHORTLISTS", "").strip() or DISCORD_WEBHOOK_URL
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1O96KAd3FrBUikER4fo3IkrLcibPjVnZcXrIziUYKKHY")
 TARGET_PROGRAM = os.getenv("TARGET_PROGRAM", "B.Tech.")
 SHEET_ALL_JOBS = "All Jobs"
@@ -41,6 +43,7 @@ BASE_API = "https://campus.placements.iitb.ac.in/api/v1"
 BLOG_API = "https://gymkhana.iitb.ac.in/instiapp/api/placement-blog"
 INSTI_TOKEN_FILE = os.path.join(BASE_DIR, "insti_token.txt")
 TESTS_FILE = os.path.join(BASE_DIR, "tests.json")
+FORMS_FILE = os.path.join(BASE_DIR, "forms.json")
 
 # Cache currency conversion rates to INR
 RATES_TO_INR = {
@@ -527,10 +530,82 @@ def check_jobs(token=None):
         json.dump(current_jobs_map, f, indent=2)
 
 TEST_TITLE_RE = re.compile(r"\b(test|aptitude|assessment|coding\s+round|online\s+test)\b", re.I)
+FORM_TITLE_RE = re.compile(r"\b(mandatory\s+form|preference\s+form|google\s+form|fill\s+the\s+form|mandatory.*form)\b", re.I)
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 MONTHS_MAP = {m[:3].lower(): i for i, m in enumerate(
     ["January", "February", "March", "April", "May", "June", "July",
      "August", "September", "October", "November", "December"], start=1)}
+
+def extract_form_links(content_html, fallback_text=""):
+    """Extracts form / survey links from HTML content or text."""
+    links = []
+    if content_html:
+        soup = BeautifulSoup(content_html, "html.parser")
+        for a in soup.find_all("a"):
+            href = (a.get("href") or "").strip()
+            if href.startswith("http") and "campus.placements.iitb.ac.in/blog" not in href:
+                links.append(href)
+    if not links and fallback_text:
+        raw_links = re.findall(r"https?://[^\s\"<>]+", fallback_text)
+        for rl in raw_links:
+            if "campus.placements.iitb.ac.in/blog" not in rl and rl not in links:
+                links.append(rl)
+    return list(dict.fromkeys(links))
+
+def parse_deadline(text):
+    """Extracts a deadline date+time from text (IST assumed). Returns ISO string or None."""
+    if not text:
+        return None
+    t = text[:6000]
+    now = datetime.now(IST_TZ)
+
+    deadline_idx = t.lower().find("deadline")
+    search_text = t[deadline_idx:deadline_idx+500] if deadline_idx != -1 else t
+
+    hour = minute = None
+    m = re.search(r"\b(\d{1,2})\s*(?:[:.]\s*(\d{2}))?\s*([ap])\.?\s*m\.?\b", search_text, re.I)
+    if not m and search_text != t:
+        m = re.search(r"\b(\d{1,2})\s*(?:[:.]\s*(\d{2}))?\s*([ap])\.?\s*m\.?\b", t, re.I)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        if m.group(3).lower() == "p" and hour != 12:
+            hour += 12
+        if m.group(3).lower() == "a" and hour == 12:
+            hour = 0
+    else:
+        m = re.search(r"\b(\d{1,2})\s*:\s*(\d{2})\s*(?:hrs|hours)?\b", search_text)
+        if not m and search_text != t:
+            m = re.search(r"\b(\d{1,2})\s*:\s*(\d{2})\s*(?:hrs|hours)?\b", t)
+        if m:
+            hour, minute = int(m.group(1)), int(m.group(2))
+    if hour is None or not (0 <= hour <= 23):
+        hour, minute = 23, 59
+
+    day = month = year = None
+    m = re.search(r"\b(\d{1,2})\s*(?:st|nd|rd|th)?[\s,-]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s*(\d{4})?\b", search_text, re.I)
+    if not m and search_text != t:
+        m = re.search(r"\b(\d{1,2})\s*(?:st|nd|rd|th)?[\s,-]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s*(\d{4})?\b", t, re.I)
+    if not m:
+        m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\s*(?:st|nd|rd|th)?,?\s*(\d{4})?\b", search_text, re.I)
+        if not m and search_text != t:
+            m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\s*(?:st|nd|rd|th)?,?\s*(\d{4})?\b", t, re.I)
+        if m:
+            month = MONTHS_MAP.get(m.group(1)[:3].lower())
+            day, year = int(m.group(2)), m.group(3)
+    else:
+        day = int(m.group(1))
+        month = MONTHS_MAP.get(m.group(2)[:3].lower())
+        year = m.group(3)
+
+    if not day or not month:
+        return None
+    year = int(year) if year else now.year
+    try:
+        dt = datetime(year, month, day, hour, minute, tzinfo=IST_TZ)
+        return dt.isoformat()
+    except Exception:
+        return None
 
 def parse_test_datetime(text):
     """Best-effort extraction of a test date+time from blog text (IST assumed).
@@ -655,6 +730,7 @@ def fetch_insti_posts(session, num=60):
             "title": title,
             "link": p.get("link") or f"https://www.insti.app/blog/{p.get('id', '')}",
             "body": body,
+            "content_html": content_html,
             "published": p.get("published") or ""
         })
     return posts
@@ -696,11 +772,55 @@ def check_blog():
     new_blogs = [p for p in posts if p["link"] not in known_links]
 
     if new_blogs:
-        test_posts = [p for p in new_blogs if TEST_TITLE_RE.search(p["title"] + "\n" + p["body"])]
-        other_posts = [p for p in new_blogs if p not in test_posts]
+        form_posts = [p for p in new_blogs if FORM_TITLE_RE.search(p["title"])]
+        remaining = [p for p in new_blogs if p not in form_posts]
+        test_posts = [p for p in remaining if TEST_TITLE_RE.search(p["title"] + "\n" + p["body"])]
+        other_posts = [p for p in remaining if p not in test_posts]
+
+        token = ensure_jwt_token()
+
+        if form_posts:
+            known_forms = []
+            if os.path.exists(FORMS_FILE):
+                try:
+                    with open(FORMS_FILE, "r") as f:
+                        known_forms = json.load(f)
+                except Exception:
+                    known_forms = []
+            known_form_links = {fm.get("link") for fm in known_forms}
+
+            for fp in form_posts:
+                company, job_ids = match_job_for_test(fp["title"], token)
+                form_links = extract_form_links(fp.get("content_html", ""), fp["body"])
+                deadline_iso = parse_deadline(fp["body"])
+                dl_str = "No deadline detected" if not deadline_iso \
+                    else f"Deadline: {datetime.fromisoformat(deadline_iso).strftime('%d %b %Y, %I:%M %p IST')}"
+                links_str = "\n".join(f"🔗 Form Link: {fl}" for fl in form_links) if form_links else "🔗 Form Link: see post"
+                desc = f"**{fp['title']}**\n{dl_str}\n{links_str}\n\n[Open Blog Post]({fp['link']})"
+
+                print(f"[+] Mandatory Form update: {fp['title']} ({dl_str})")
+                send_discord_embed(
+                    DISCORD_WEBHOOK_FORMS,
+                    f"📋 Mandatory Form: {company or fp['title'][:80]}",
+                    desc,
+                    color=15105570
+                )
+                if fp["link"] not in known_form_links:
+                    known_forms.append({
+                        "title": fp["title"],
+                        "link": fp["link"],
+                        "company": company,
+                        "job_ids": job_ids,
+                        "deadline": deadline_iso,
+                        "form_links": form_links,
+                        "added_at": datetime.now(timezone.utc).isoformat(),
+                        "reminded_1h": False
+                    })
+
+            with open(FORMS_FILE, "w") as f:
+                json.dump(known_forms, f, indent=2)
 
         if test_posts:
-            token = ensure_jwt_token()
             known_tests = []
             if os.path.exists(TESTS_FILE):
                 try:
@@ -829,6 +949,51 @@ def check_reminders(token):
     if changed:
         with open(TESTS_FILE, "w") as f:
             json.dump(tests, f, indent=2)
+
+    # Check mandatory form reminders (1 hour before deadline)
+    forms = []
+    if os.path.exists(FORMS_FILE):
+        try:
+            with open(FORMS_FILE, "r") as f:
+                forms = json.load(f)
+        except Exception:
+            forms = []
+    pending_forms = [fm for fm in forms if fm.get("deadline") and not fm.get("reminded_1h")]
+    if pending_forms:
+        forms_changed = False
+        for fm in pending_forms:
+            try:
+                deadline_dt = datetime.fromisoformat(fm["deadline"])
+            except Exception:
+                continue
+            delta_min = (deadline_dt - now).total_seconds() / 60
+            if delta_min <= 0:
+                fm["reminded_1h"] = True
+                forms_changed = True
+                continue
+
+            # Check if this form is for a signed job (or matches signed companies)
+            title_and_company = f"{fm.get('company', '')} {fm.get('title', '')}".lower()
+            signed_companies = [c.lower() for c in signed_map.values()]
+            first_tokens = [re.split(r"[\s.,()\[\]]+", c)[0] for c in signed_companies]
+            is_signed = any(jid in (fm.get("job_ids") or []) for jid in signed_map) or \
+                any(len(c) >= 4 and c in title_and_company for c in signed_companies) or \
+                any(len(tok) >= 4 and tok in title_and_company for tok in first_tokens)
+            if not is_signed:
+                continue
+
+            if delta_min <= 60 and not fm.get("reminded_1h"):
+                links_text = "\n".join(f"🔗 {fl}" for fl in fm.get("form_links", [])) if fm.get("form_links") else fm["link"]
+                send_notifications(
+                    "⏰ Mandatory Form Reminder (1 hour)",
+                    f"{fm.get('company') or 'Company'} - {fm['title']}\nDeadline in ~{int(delta_min)} min ({deadline_dt.astimezone(IST_TZ).strftime('%I:%M %p IST')})\n{links_text}",
+                    DISCORD_WEBHOOK_REMINDERS, color=16776960)
+                fm["reminded_1h"] = True
+                forms_changed = True
+
+        if forms_changed:
+            with open(FORMS_FILE, "w") as f:
+                json.dump(forms, f, indent=2)
 
 def run_all():
     print("----------------------------------------------------------------")

@@ -10,6 +10,7 @@ config.env
 known_jobs.json
 known_blogs.json
 tests.json
+forms.json
 monitor.log
 chrome_data/
 __pycache__/
