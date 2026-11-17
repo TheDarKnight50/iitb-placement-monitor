@@ -557,6 +557,7 @@ def check_jobs(token=None):
 
 TEST_TITLE_RE = re.compile(r"\b(test|aptitude|assessment|coding\s+round|online\s+test)\b", re.I)
 FORM_TITLE_RE = re.compile(r"\b(mandatory\s+form|preference\s+form|google\s+form|fill\s+the\s+form|mandatory.*form)\b", re.I)
+FORM_BODY_RE = re.compile(r"\b(mandatory\s+form|preference\s+form|fill\s+(?:the\s+|this\s+)?mandatory\s+form|fill\s+the\s+following\s+form|google\s+form)\b", re.I)
 SHORTLIST_TITLE_RE = re.compile(r"\b(shortlist|short-list|waitlist|wait-list)\b", re.I)
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 MONTHS_MAP = {m[:3].lower(): i for i, m in enumerate(
@@ -578,6 +579,21 @@ def extract_form_links(content_html, fallback_text=""):
             if "campus.placements.iitb.ac.in/blog" not in rl and rl not in links:
                 links.append(rl)
     return list(dict.fromkeys(links))
+
+def has_mandatory_form(post):
+    """Detects whether a post contains a mandatory form (in title or embedded in body)."""
+    title = post.get("title", "")
+    body = post.get("body", "")
+    content_html = post.get("content_html", "")
+
+    title_match = bool(FORM_TITLE_RE.search(title))
+    body_match = bool(FORM_BODY_RE.search(body))
+    form_links = extract_form_links(content_html, body)
+
+    if title_match or (body_match and len(form_links) > 0):
+        deadline_iso = parse_deadline(body)
+        return True, form_links, deadline_iso
+    return False, [], None
 
 def parse_deadline(text):
     """Extracts a deadline date+time from text (IST assumed). Returns ISO string or None."""
@@ -799,29 +815,23 @@ def check_blog():
     new_blogs = [p for p in posts if p["link"] not in known_links]
 
     if new_blogs:
-        form_posts = [p for p in new_blogs if FORM_TITLE_RE.search(p["title"])]
-        rem1 = [p for p in new_blogs if p not in form_posts]
-        shortlist_posts = [p for p in rem1 if SHORTLIST_TITLE_RE.search(p["title"])]
-        rem2 = [p for p in rem1 if p not in shortlist_posts]
-        test_posts = [p for p in rem2 if TEST_TITLE_RE.search(p["title"] + "\n" + p["body"])]
-        other_posts = [p for p in rem2 if p not in test_posts]
-
         token = ensure_jwt_token()
 
-        if form_posts:
-            known_forms = []
-            if os.path.exists(FORMS_FILE):
-                try:
-                    with open(FORMS_FILE, "r") as f:
-                        known_forms = json.load(f)
-                except Exception:
-                    known_forms = []
-            known_form_links = {fm.get("link") for fm in known_forms}
+        # 1. Process Mandatory Forms first (standalone or embedded in any JAF/other post)
+        known_forms = []
+        if os.path.exists(FORMS_FILE):
+            try:
+                with open(FORMS_FILE, "r") as f:
+                    known_forms = json.load(f)
+            except Exception:
+                known_forms = []
+        known_form_links = {fm.get("link") for fm in known_forms}
+        forms_added = False
 
-            for fp in form_posts:
+        for fp in new_blogs:
+            is_form, form_links, deadline_iso = has_mandatory_form(fp)
+            if is_form and fp["link"] not in known_form_links:
                 company, job_ids = match_job_for_test(fp["title"], token)
-                form_links = extract_form_links(fp.get("content_html", ""), fp["body"])
-                deadline_iso = parse_deadline(fp["body"])
                 dl_str = "No deadline detected" if not deadline_iso \
                     else f"Deadline: {datetime.fromisoformat(deadline_iso).strftime('%d %b %Y, %I:%M %p IST')}"
                 links_str = "\n".join(f"🔗 Form Link: {fl}" for fl in form_links) if form_links else "🔗 Form Link: see post"
@@ -834,20 +844,27 @@ def check_blog():
                     desc,
                     color=15105570
                 )
-                if fp["link"] not in known_form_links:
-                    known_forms.append({
-                        "title": fp["title"],
-                        "link": fp["link"],
-                        "company": company,
-                        "job_ids": job_ids,
-                        "deadline": deadline_iso,
-                        "form_links": form_links,
-                        "added_at": datetime.now(timezone.utc).isoformat(),
-                        "reminded_1h": False
-                    })
+                known_forms.append({
+                    "title": fp["title"],
+                    "link": fp["link"],
+                    "company": company,
+                    "job_ids": job_ids,
+                    "deadline": deadline_iso,
+                    "form_links": form_links,
+                    "added_at": datetime.now(timezone.utc).isoformat(),
+                    "reminded_1h": False
+                })
+                known_form_links.add(fp["link"])
+                forms_added = True
 
+        if forms_added:
             with open(FORMS_FILE, "w") as f:
                 json.dump(known_forms, f, indent=2)
+
+        # 2. Process other channels
+        shortlist_posts = [p for p in new_blogs if SHORTLIST_TITLE_RE.search(p["title"])]
+        test_posts = [p for p in new_blogs if TEST_TITLE_RE.search(p["title"] + "\n" + p["body"]) and p not in shortlist_posts]
+        other_posts = [p for p in new_blogs if p not in shortlist_posts and p not in test_posts and not FORM_TITLE_RE.search(p["title"])]
 
         if shortlist_posts:
             # Check applicant roll number if token available
@@ -1267,11 +1284,10 @@ def backfill_forms_and_shortlists(days=7):
             continue
 
         title = p["title"]
-        # Check Form
-        if FORM_TITLE_RE.search(title):
+        # Check Form (standalone or embedded)
+        is_form, form_links, deadline_iso = has_mandatory_form(p)
+        if is_form:
             company, job_ids = match_job_for_test(title, token)
-            form_links = extract_form_links(p.get("content_html", ""), p["body"])
-            deadline_iso = parse_deadline(p["body"])
             dl_str = "No deadline detected" if not deadline_iso \
                 else f"Deadline: {datetime.fromisoformat(deadline_iso).strftime('%d %b %Y, %I:%M %p IST')}"
             links_str = "\n".join(f"🔗 Form Link: {fl}" for fl in form_links) if form_links else "🔗 Form Link: see post"
@@ -1296,6 +1312,7 @@ def backfill_forms_and_shortlists(days=7):
                     "added_at": datetime.now(timezone.utc).isoformat(),
                     "reminded_1h": False
                 })
+                known_form_links.add(p["link"])
                 known_form_links.add(p["link"])
 
         # Check Shortlist
