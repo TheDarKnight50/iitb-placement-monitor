@@ -26,14 +26,31 @@ An automated monitoring suite for the IIT Bombay campus placement portal and pla
    - Update your sheet and check for alerts anytime on demand with a single short command.
 7. **Zero-Window Background Daemon**:
    - Runs silently via `systemd` user service without popping up browser windows or interrupting your workflow.
+8. **Deadline Reminders**:
+   - A daily digest (default 9 AM IST) of JAFs you're **eligible for but haven't signed** that close in the next 48 hours.
+   - A last-call warning 3 hours before each of those JAFs closes (re-sent if the deadline is extended).
+9. **JAF Change Detection**:
+   - Alerts when an existing JAF changes: deadline extended, CTC revised, eligibility changed, test round added.
+   - Becoming eligible or a deadline/test change on an eligible JAF triggers a desktop pop-up; minor edits go to Discord only.
+   - Ignores exchange-rate noise on foreign-currency offers.
+10. **Self-Monitoring**:
+    - Alerts (desktop + Discord) when the portal token is about to expire or has expired, when the InstiApp session is rejected, or when a Discord webhook dies (e.g. its channel was deleted). Each problem is alerted at most once every 12 hours.
+    - `python3 scraper.py --check-webhooks` verifies every webhook without posting anything.
+11. **Summary Tab & Calendar Export**:
+    - A `Summary` sheet tab with totals, eligible JAFs closing soon, top eligible CTCs, upcoming tests and the last update time.
+    - `placements.ics` with deadlines for eligible unsigned JAFs and tests for signed JAFs (with alarms) - import it into Google / Apple Calendar to get reminders on your phone.
 
 ---
 
 ## 📁 Repository Structure
 
 ```
-├── common.py             # Shared utilities (Google Sheets client, JWT decoding, notifications)
+├── common.py             # Shared utilities (Google Sheets client, JWT decoding, notifications, webhook checks)
 ├── scraper.py            # Core engine (API scraper, salary extractor, blog checker, sheets updater)
+├── job_changes.py        # Detects changes to existing JAFs between runs
+├── deadlines.py          # Deadline digest + last-call warning logic
+├── calendar_export.py    # Builds the placements.ics calendar file
+├── tests/                # Unit tests (python -m unittest discover -s tests)
 ├── set_token.py          # Quick setup helper to paste your portal JWT session token
 ├── set_insti_token.py    # Setup helper for the InstiApp session (blog/test monitoring)
 ├── blog_login.py         # Optional: re-establish portal SSO via browser (for JWT auto-refresh)
@@ -115,7 +132,7 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 1. Open your normal browser where you are logged into [insti.app](https://www.insti.app/blog/) (the placement blog's public mirror).
 2. Press **F12**, open the **Console** tab, paste and run:
    ```javascript
-   copy(localStorage.getItem('session_id'))
+   copy(localStorage.getItem('sessionid'))
    ```
 3. In your terminal, run:
    ```bash
@@ -125,10 +142,22 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 
 ### 4c. Discord Channel Webhooks (Optional)
 
-For per-channel routing (`new-jafs`, `tests`, `reminders`, `forms`, `shortlists`), create one webhook per channel
-(*Edit Channel → Integrations → Webhooks → New Webhook → Copy URL*) and fill in
-`DISCORD_WEBHOOK_NEW_JAFS`, `DISCORD_WEBHOOK_TESTS`, `DISCORD_WEBHOOK_REMINDERS`, `DISCORD_WEBHOOK_FORMS` and `DISCORD_WEBHOOK_SHORTLISTS` in `config.env`.
-Any missing webhook falls back to the generic `DISCORD_WEBHOOK_URL`.
+For per-channel routing, create one webhook per channel
+(*Edit Channel → Integrations → Webhooks → New Webhook → Copy URL*) and fill in `config.env`:
+
+| Variable | What goes there | Falls back to |
+|---|---|---|
+| `DISCORD_WEBHOOK_NEW_JAFS` | New JAFs + JAF changes | `DISCORD_WEBHOOK_URL` |
+| `DISCORD_WEBHOOK_TESTS` | Test announcements | `DISCORD_WEBHOOK_URL` |
+| `DISCORD_WEBHOOK_REMINDERS` | 1h / 30m test reminders, form reminders, 11 PM "closing tonight" | `DISCORD_WEBHOOK_URL` |
+| `DISCORD_WEBHOOK_FORMS` | Mandatory forms | `DISCORD_WEBHOOK_URL` |
+| `DISCORD_WEBHOOK_SHORTLISTS` | Interview / test shortlists | `DISCORD_WEBHOOK_URL` |
+| `DISCORD_WEBHOOK_DEADLINES` | Deadline digest + last-call warnings | `DISCORD_WEBHOOK_REMINDERS` |
+| `DISCORD_WEBHOOK_BLOG` | Other blog posts | `DISCORD_WEBHOOK_URL` |
+| `DISCORD_WEBHOOK_ALERTS` | Bot health (expired tokens, dead webhooks) | `DISCORD_WEBHOOK_URL` |
+
+> ⚠️ Deleting a Discord channel also deletes its webhooks. After changing channels, run
+> `python3 scraper.py --check-webhooks` to confirm every webhook still works (it posts nothing).
 
 ---
 
@@ -138,7 +167,17 @@ Test the scraper manually:
 ```bash
 python3 scraper.py
 ```
-Check your Google Sheet! Both **`All Jobs`** and **`Signed JAFs`** tabs will be updated.
+Check your Google Sheet! The **`All Jobs`**, **`Signed JAFs`** and **`Summary`** tabs will be updated.
+
+Other commands:
+```bash
+python3 scraper.py --check-webhooks   # verify all Discord webhooks (sends nothing)
+python3 scraper.py --backfill 2       # re-send test posts from the last 2 days
+python -m unittest discover -s tests  # run the unit tests
+```
+
+To get deadlines and tests in your phone's calendar, import `placements.ics`
+(Google Calendar → Settings → Import & export). Re-importing updates existing events instead of duplicating them.
 
 ---
 
@@ -169,7 +208,7 @@ To automatically monitor every 15 minutes whenever your laptop is running:
 
    [Service]
    Type=simple
-   ExecStart=/bin/bash /absolute/path/to/run_monitor.sh
+   ExecStart=/bin/bash /absolute/path/to/repo/run_monitor.sh
    WorkingDirectory=/absolute/path/to/repo
    Restart=always
    RestartSec=60

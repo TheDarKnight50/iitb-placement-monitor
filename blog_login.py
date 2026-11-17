@@ -5,10 +5,11 @@ Opens a VISIBLE browser window using the same persistent profile (chrome_data/)
 that scraper.py uses. Log in with your IITB credentials; the session cookies
 are saved automatically. Then verify the blog is accessible.
 """
+import os
 import sys
 from playwright.sync_api import sync_playwright
 
-BASE_DIR = "/home/aryan/Desktop/Imp/Placements/scripts"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 USER_DATA_DIR = f"{BASE_DIR}/chrome_data"
 BLOG_URL = "https://campus.placements.iitb.ac.in/blog/placement/"
 

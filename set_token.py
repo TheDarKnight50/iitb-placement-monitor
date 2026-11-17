@@ -2,7 +2,7 @@
 import sys
 import os
 
-TOKEN_FILE = "/home/aryan/Desktop/Imp/Placements/scripts/token.txt"
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt")
 
 def main():
     print("===================================================================")

@@ -13,6 +13,11 @@ tests.json
 forms.json
 .daily_closing_state
 monitor.log
+deadline_state.json
+health_state.json
+.dead_webhooks.json
+.blog_session_expired
+placements.ics
 chrome_data/
 __pycache__/
 *.pyc

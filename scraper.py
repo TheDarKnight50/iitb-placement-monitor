@@ -10,7 +10,11 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
-from common import get_gspread_client, parse_jwt, send_notifications, send_discord_embed
+from common import (get_gspread_client, parse_jwt, send_notifications, send_discord_embed,
+                    desktop_notify, check_webhook, mask_webhook)
+from job_changes import diff_jobs, format_changes, is_important
+from deadlines import compute_deadline_alerts, format_items as format_deadline_items
+from calendar_export import build_ics, placement_events
 
 # Load environment configuration (prefer config.env, fallback to .env)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,10 +38,28 @@ DISCORD_WEBHOOK_TESTS = os.getenv("DISCORD_WEBHOOK_TESTS", "").strip() or DISCOR
 DISCORD_WEBHOOK_REMINDERS = os.getenv("DISCORD_WEBHOOK_REMINDERS", "").strip() or DISCORD_WEBHOOK_URL
 DISCORD_WEBHOOK_FORMS = os.getenv("DISCORD_WEBHOOK_FORMS", "").strip() or DISCORD_WEBHOOK_URL
 DISCORD_WEBHOOK_SHORTLISTS = os.getenv("DISCORD_WEBHOOK_SHORTLISTS", "").strip() or DISCORD_WEBHOOK_URL
+# Deadline digests/warnings: own channel if set, otherwise the reminders channel
+DISCORD_WEBHOOK_DEADLINES = os.getenv("DISCORD_WEBHOOK_DEADLINES", "").strip() or DISCORD_WEBHOOK_REMINDERS
+# Non-test blog posts: own channel if set (keeps the general channel quiet), otherwise generic
+DISCORD_WEBHOOK_BLOG = os.getenv("DISCORD_WEBHOOK_BLOG", "").strip() or DISCORD_WEBHOOK_URL
+# Bot health problems (expired tokens, dead webhooks): own channel if set, otherwise generic
+DISCORD_WEBHOOK_ALERTS = os.getenv("DISCORD_WEBHOOK_ALERTS", "").strip() or DISCORD_WEBHOOK_URL
+
+def _int_env(name, default):
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+DEADLINE_WARN_HOURS = _int_env("DEADLINE_WARN_HOURS", 3)
+DEADLINE_DIGEST_HOUR = _int_env("DEADLINE_DIGEST_HOUR", 9)        # IST, 0-23
+DEADLINE_DIGEST_WINDOW_HOURS = _int_env("DEADLINE_DIGEST_WINDOW_HOURS", 48)
+ALERT_ON_JOB_CHANGES = os.getenv("ALERT_ON_JOB_CHANGES", "true").strip().lower() not in ("0", "false", "no")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1O96KAd3FrBUikER4fo3IkrLcibPjVnZcXrIziUYKKHY")
 TARGET_PROGRAM = os.getenv("TARGET_PROGRAM", "B.Tech.")
 SHEET_ALL_JOBS = "All Jobs"
 SHEET_SIGNED_JOBS = "Signed JAFs"
+SHEET_SUMMARY = "Summary"
 
 BASE_API = "https://campus.placements.iitb.ac.in/api/v1"
 BLOG_API = "https://gymkhana.iitb.ac.in/instiapp/api/placement-blog"
@@ -45,6 +67,9 @@ INSTI_TOKEN_FILE = os.path.join(BASE_DIR, "insti_token.txt")
 TESTS_FILE = os.path.join(BASE_DIR, "tests.json")
 FORMS_FILE = os.path.join(BASE_DIR, "forms.json")
 DAILY_CLOSING_STATE_FILE = os.path.join(BASE_DIR, ".daily_closing_state")
+DEADLINE_STATE_FILE = os.path.join(BASE_DIR, "deadline_state.json")
+HEALTH_STATE_FILE = os.path.join(BASE_DIR, "health_state.json")
+CALENDAR_FILE = os.path.join(BASE_DIR, os.getenv("CALENDAR_FILE", "placements.ics"))
 
 # Cache currency conversion rates to INR
 RATES_TO_INR = {
@@ -171,6 +196,13 @@ def format_inr(amount_inr):
         return f"₹{crores:.2f} Cr"
     return f"₹{lakhs:.2f} LPA"
 
+def to_inr_value(amount, currency):
+    """Numeric INR value (for sorting/stats). 0 when unknown."""
+    try:
+        return float(amount or 0) * RATES_TO_INR.get((currency or "INR").upper(), 1.0)
+    except (TypeError, ValueError):
+        return 0.0
+
 def convert_to_inr_formatted(amount, currency):
     """Converts amount in any foreign currency to INR and returns formatted string."""
     if not amount:
@@ -291,7 +323,8 @@ def fetch_jobs_data(token):
         salaries, currency = job_salary_map.get(job_id, ([], "INR"))
         base_pay_str = "N/A"
         ctc_str = "N/A"
-        
+        raw_base = raw_ctc = None
+
         if salaries:
             if is_eligible:
                 # 1. If eligible, find exact B.Tech program salary entry
@@ -320,6 +353,7 @@ def fetch_jobs_data(token):
                         if amt and float(amt) > 0:
                             ctc_str = convert_to_inr_formatted(amt, currency)
                             base_pay_str = ctc_str
+                            raw_ctc = amt
                             break
 
         has_signed = job_id in signed_job_ids
@@ -332,8 +366,11 @@ def fetch_jobs_data(token):
             "base_pay": base_pay_str,
             "ctc": ctc_str,
             "last_day": last_day_str,
+            "closes_at": j.get("closesAt") or "",
             "opens_at": j.get("opensAt", ""),
-            "closes_at": j.get("closesAt", ""),
+            # Raw (unconverted) salary, so exchange-rate moves don't look like CTC changes
+            "salary_key": f"{currency} {raw_base or 0} {raw_ctc or 0}",
+            "ctc_inr": round(to_inr_value(raw_ctc or raw_base, currency)),
             "signed_at": signed_at_time,
             "eligible": "Eligible" if is_eligible else "Not Eligible",
             "signed": "Yes" if has_signed else "No",
@@ -489,6 +526,87 @@ def update_google_sheet(jobs):
     apply_sheet_formatting_and_colors(sh, ws_signed, len(rows_signed))
     print(f"[+] '{SHEET_SIGNED_JOBS}' updated with {len(signed_jobs)} signed jobs.")
 
+    # 3. Summary tab (stats + upcoming deadlines + last update time)
+    try:
+        update_summary_sheet(sh, jobs)
+    except Exception as e:
+        print(f"[!] Warning updating '{SHEET_SUMMARY}' tab: {e}")
+
+
+def build_summary_rows(jobs, tests, now=None):
+    """Rows for the Summary tab. Kept separate from the Sheets call so it's testable."""
+    now = now or datetime.now(timezone.utc)
+    eligible = [j for j in jobs if j["eligible"] == "Eligible"]
+    signed = [j for j in jobs if j["signed"] == "Yes"]
+    open_unsigned = []
+    for j in eligible:
+        if j["signed"] == "Yes" or not j.get("closes_at"):
+            continue
+        try:
+            closes = datetime.fromisoformat(j["closes_at"].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if closes > now:
+            open_unsigned.append((closes, j))
+    open_unsigned.sort(key=lambda p: p[0])
+
+    rows = [
+        ["Placement Monitor - Summary", ""],
+        ["Last updated", now.astimezone(IST_TZ).strftime("%d %b %Y, %I:%M %p IST")],
+        ["", ""],
+        ["Total JAFs", len(jobs)],
+        ["Eligible", len(eligible)],
+        ["Signed", len(signed)],
+        ["Eligible & still open (unsigned)", len(open_unsigned)],
+        ["", ""],
+        ["Closing soon (eligible, unsigned)", "Closes (IST)", "CTC"],
+    ]
+    for closes, j in open_unsigned[:10]:
+        rows.append([f"{j['company']} - {j['role']}", closes.astimezone(IST_TZ).strftime("%d %b, %I:%M %p"), j["ctc"]])
+    if not open_unsigned:
+        rows.append(["(none)", "", ""])
+
+    rows += [["", ""], ["Top eligible CTCs", "CTC", "Signed?"]]
+    for j in sorted(eligible, key=lambda j: j.get("ctc_inr", 0), reverse=True)[:10]:
+        rows.append([f"{j['company']} - {j['role']}", j["ctc"], j["signed"]])
+
+    upcoming_tests = []
+    for t in tests:
+        try:
+            dt = datetime.fromisoformat(t["test_time"]) if t.get("test_time") else None
+        except ValueError:
+            dt = None
+        if dt and dt > now:
+            upcoming_tests.append((dt, t))
+    upcoming_tests.sort(key=lambda p: p[0])
+    rows += [["", ""], ["Upcoming tests", "Starts (IST)", "Link"]]
+    for dt, t in upcoming_tests[:10]:
+        rows.append([t.get("company") or t["title"][:60], dt.astimezone(IST_TZ).strftime("%d %b, %I:%M %p"), t.get("link", "")])
+    if not upcoming_tests:
+        rows.append(["(none)", "", ""])
+    return rows
+
+
+def update_summary_sheet(sh, jobs):
+    rows = build_summary_rows(jobs, load_json(TESTS_FILE, []))
+    try:
+        ws = sh.worksheet(SHEET_SUMMARY)
+    except Exception:
+        ws = sh.add_worksheet(title=SHEET_SUMMARY, rows="100", cols="4")
+    width = max(len(r) for r in rows)
+    ws.clear()
+    ws.update(values=[r + [""] * (width - len(r)) for r in rows], range_name="A1")
+    try:
+        ws.format("A1", {"textFormat": {"bold": True, "fontSize": 13}})
+        bold_rows = [i + 1 for i, r in enumerate(rows) if r and r[0] in (
+            "Closing soon (eligible, unsigned)", "Top eligible CTCs", "Upcoming tests")]
+        for r in bold_rows:
+            ws.format(f"A{r}:C{r}", {"textFormat": {"bold": True},
+                                     "backgroundColor": {"red": 0.87, "green": 0.91, "blue": 0.97}})
+    except Exception:
+        pass
+    print(f"[+] '{SHEET_SUMMARY}' tab updated.")
+
 def check_jobs(token=None):
     """Checks for new jobs, updates sheets, and alerts on newly added ones."""
     token = token or ensure_jwt_token()
@@ -509,27 +627,11 @@ def check_jobs(token=None):
     current_jobs_map = {str(j["id"]): j for j in jobs}
     
     new_jobs = []
-    updated_jobs = []
     if known_jobs:
         for j_id, j_data in current_jobs_map.items():
             if j_id not in known_jobs:
                 new_jobs.append(j_data)
-            else:
-                old_data = known_jobs[j_id]
-                changes = []
-                if old_data.get("eligible") != j_data.get("eligible"):
-                    changes.append(f"Eligibility: {old_data.get('eligible')} ➔ **{j_data.get('eligible')}**")
-                if old_data.get("last_day") != j_data.get("last_day"):
-                    changes.append(f"Deadline: {old_data.get('last_day')} ➔ **{j_data.get('last_day')}**")
-                if old_data.get("base_pay") != j_data.get("base_pay"):
-                    changes.append(f"Base: {old_data.get('base_pay')} ➔ **{j_data.get('base_pay')}**")
-                if old_data.get("ctc") != j_data.get("ctc"):
-                    changes.append(f"CTC: {old_data.get('ctc')} ➔ **{j_data.get('ctc')}**")
-                if old_data.get("signed") != j_data.get("signed"):
-                    changes.append(f"Signed: {old_data.get('signed')} ➔ **{j_data.get('signed')}**")
-                if changes:
-                    updated_jobs.append((j_data, changes))
-                
+
     if new_jobs:
         msg = f"Found {len(new_jobs)} new job(s):\n"
         for nj in new_jobs[:5]:
@@ -539,13 +641,22 @@ def check_jobs(token=None):
             msg += f"...and {len(new_jobs) - 5} more."
         send_notifications("🆕 New JAF Opening!", msg, DISCORD_WEBHOOK_NEW_JAFS, color=5763719)
 
-    if updated_jobs:
-        msg = f"Detected changes in {len(updated_jobs)} JAF(s):\n"
-        for uj, chgs in updated_jobs[:5]:
-            msg += f"• **{uj['company']}** - {uj['role']}\n  " + " | ".join(chgs) + "\n"
-        if len(updated_jobs) > 5:
-            msg += f"...and {len(updated_jobs) - 5} more updated JAFs."
-        send_notifications("🔄 JAF Updated!", msg, DISCORD_WEBHOOK_NEW_JAFS, color=3447003)
+    # Changes to jobs we already knew about (deadline extended, CTC revised,
+    # became eligible, test round added...)
+    if known_jobs and ALERT_ON_JOB_CHANGES:
+        changes = diff_jobs(known_jobs, current_jobs_map)
+        if changes:
+            important = [c for c in changes if is_important(c)]
+            for c in changes:
+                print(f"[+] JAF changed: {c['company']} - {c['role']}: {c['changes']}")
+            title = (f"✏️ {len(changes)} JAF(s) updated" +
+                     (f" - {len(important)} need your attention" if important else ""))
+            body = format_changes(sorted(changes, key=lambda c: not is_important(c)))
+            if important:
+                send_notifications(title, body, DISCORD_WEBHOOK_NEW_JAFS, color=15105570)
+            else:
+                # Minor edits: Discord only, no desktop pop-up
+                send_discord_embed(DISCORD_WEBHOOK_NEW_JAFS, title, body, color=9807270)
 
     try:
         update_google_sheet(jobs)
@@ -554,6 +665,7 @@ def check_jobs(token=None):
 
     with open(KNOWN_JOBS_FILE, "w") as f:
         json.dump(current_jobs_map, f, indent=2)
+    return jobs
 
 TEST_TITLE_RE = re.compile(r"\b(test|aptitude|assessment|coding\s+round|online\s+test)\b", re.I)
 FORM_TITLE_RE = re.compile(r"\b(mandatory\s+form|preference\s+form|google\s+form|fill\s+the\s+form|mandatory.*form)\b", re.I)
@@ -773,16 +885,22 @@ def check_blog():
         print(f"[!] {warn_msg}")
         if not os.path.exists(flag_file):
             open(flag_file, "w").close()
-            send_notifications("⚠️ Blog Monitor Stopped", warn_msg, DISCORD_WEBHOOK_URL)
+            send_notifications("⚠️ Blog Monitor Stopped", warn_msg, DISCORD_WEBHOOK_ALERTS)
         return
     try:
         posts = fetch_insti_posts(session)
     except Exception as e:
         print(f"[!] Error fetching InstiApp blog: {e}")
+        if any(code in str(e) for code in ("returned 401", "returned 403")):
+            health_alert("insti_session",
+                         "⚠️ InstiApp session expired",
+                         "The placement blog rejected your InstiApp session, so blog and test "
+                         "alerts are PAUSED. Run 'python3 set_insti_token.py' with a fresh sessionid.")
         return
     if os.path.exists(flag_file):
         os.remove(flag_file)
         print("[+] Blog monitoring restored.")
+    clear_health_alert("insti_session")
 
     if not posts:
         return
@@ -916,30 +1034,38 @@ def check_blog():
             msg = f"Found {len(other_posts)} new blog post(s):\n"
             for nb in other_posts[:5]:
                 msg += f"• {nb['title']}\n{nb['link']}\n"
-            send_notifications("New Placement Blog Update!", msg, DISCORD_WEBHOOK_URL)
+            send_notifications("New Placement Blog Update!", msg, DISCORD_WEBHOOK_BLOG)
 
     with open(KNOWN_BLOGS_FILE, "w") as f:
         json.dump([{"title": p["title"], "link": p["link"]} for p in posts], f, indent=2)
 
+def test_is_for_signed_job(t, signed_map):
+    """Is this test for a job I signed? signed_map = {job_id: company_name}.
+    Matches by stored job_ids, full company name, or distinctive first token
+    (e.g. "Hyde Inc." matches "Hyde AI")."""
+    title_and_company = f"{t.get('company', '')} {t.get('title', '')}".lower()
+    signed_companies = [c.lower() for c in signed_map.values() if c]
+    first_tokens = [re.split(r"[\s.,()\[\]]+", c)[0] for c in signed_companies]
+    return any(jid in (t.get("job_ids") or []) for jid in signed_map) or \
+        any(len(c) >= 4 and c in title_and_company for c in signed_companies) or \
+        any(len(tok) >= 4 and tok in title_and_company for tok in first_tokens)
+
 def check_reminders(token):
-    """Sends 1-hour and 30-minute reminders for upcoming tests of signed JAFs."""
+    """Sends 1-hour and 30-minute reminders for upcoming tests of signed JAFs,
+    and 1-hour reminders for mandatory-form deadlines of signed JAFs."""
     if not token:
         print("[*] No token - skipping test reminders.")
         return
-    tests = []
-    if os.path.exists(TESTS_FILE):
-        try:
-            with open(TESTS_FILE, "r") as f:
-                tests = json.load(f)
-        except Exception:
-            tests = []
-    if not tests:
-        return
+    tests = load_json(TESTS_FILE, [])
+    forms = load_json(FORMS_FILE, [])
 
     now = datetime.now(timezone.utc)
     pending = [t for t in tests
                if t.get("test_time") and not (t.get("reminded_1h") and t.get("reminded_30m"))]
-    if not pending:
+    pending_forms = [fm for fm in forms if fm.get("deadline") and not fm.get("reminded_1h")]
+    # Only return early when there is nothing to remind about at all (tests OR forms);
+    # previously form reminders were skipped whenever no test was pending.
+    if not pending and not pending_forms:
         return
 
     # Which jobs have I signed? (applications API includes the job object)
@@ -975,15 +1101,7 @@ def check_reminders(token):
             changed = True
             continue
 
-        # Is this test for a job I signed? (by stored job_ids or company-name match)
-        title_and_company = f"{t.get('company', '')} {t.get('title', '')}".lower()
-        signed_companies = [c.lower() for c in signed_map.values()]
-        # full name, distinctive first token (e.g. "Hyde Inc." matches "Hyde AI")
-        first_tokens = [re.split(r"[\s.,()\[\]]+", c)[0] for c in signed_companies]
-        is_signed = any(jid in (t.get("job_ids") or []) for jid in signed_map) or \
-            any(len(c) >= 4 and c in title_and_company for c in signed_companies) or \
-            any(len(tok) >= 4 and tok in title_and_company for tok in first_tokens)
-        if not is_signed:
+        if not test_is_for_signed_job(t, signed_map):
             continue
 
         if delta_min <= 60 and not t.get("reminded_1h"):
@@ -1006,14 +1124,6 @@ def check_reminders(token):
             json.dump(tests, f, indent=2)
 
     # Check mandatory form reminders (1 hour before deadline)
-    forms = []
-    if os.path.exists(FORMS_FILE):
-        try:
-            with open(FORMS_FILE, "r") as f:
-                forms = json.load(f)
-        except Exception:
-            forms = []
-    pending_forms = [fm for fm in forms if fm.get("deadline") and not fm.get("reminded_1h")]
     if pending_forms:
         forms_changed = False
         for fm in pending_forms:
@@ -1027,14 +1137,8 @@ def check_reminders(token):
                 forms_changed = True
                 continue
 
-            # Check if this form is for a signed job (or matches signed companies)
-            title_and_company = f"{fm.get('company', '')} {fm.get('title', '')}".lower()
-            signed_companies = [c.lower() for c in signed_map.values()]
-            first_tokens = [re.split(r"[\s.,()\[\]]+", c)[0] for c in signed_companies]
-            is_signed = any(jid in (fm.get("job_ids") or []) for jid in signed_map) or \
-                any(len(c) >= 4 and c in title_and_company for c in signed_companies) or \
-                any(len(tok) >= 4 and tok in title_and_company for tok in first_tokens)
-            if not is_signed:
+            # Only for forms of jobs I signed (same matching as test reminders)
+            if not test_is_for_signed_job(fm, signed_map):
                 continue
 
             if delta_min <= 60 and not fm.get("reminded_1h"):
@@ -1127,27 +1231,201 @@ def check_daily_closing_jafs():
 
     with open(DAILY_CLOSING_STATE_FILE, "w") as f:
         f.write(today_str)
+# ------------------------------------------------------------------ helpers / state
+
+def load_json(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return default
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ------------------------------------------------------------------ health
+
+HEALTH_REALERT_HOURS = 12
+TOKEN_WARN_HOURS = _int_env("TOKEN_WARN_HOURS", 24)
+
+def health_alert(key, title, message):
+    """Alerts about a bot problem (desktop + Discord) at most once every
+    HEALTH_REALERT_HOURS, instead of failing silently every 15 minutes."""
+    state = load_json(HEALTH_STATE_FILE, {})
+    alerts = state.setdefault("alerts", {})
+    now = datetime.now(timezone.utc)
+    last = alerts.get(key)
+    if last:
+        try:
+            if now - datetime.fromisoformat(last) < timedelta(hours=HEALTH_REALERT_HOURS):
+                print(f"[!] {title} (already alerted)")
+                return
+        except ValueError:
+            pass
+    send_notifications(title, message, DISCORD_WEBHOOK_ALERTS, color=15158332)
+    alerts[key] = now.isoformat()
+    save_json(HEALTH_STATE_FILE, state)
+
+def clear_health_alert(key):
+    state = load_json(HEALTH_STATE_FILE, {})
+    if state.get("alerts", {}).pop(key, None):
+        save_json(HEALTH_STATE_FILE, state)
+        print(f"[+] Health issue '{key}' resolved.")
+
+def check_token_health(token):
+    """Warns before (and after) the portal JWT expires - without it nothing works."""
+    if not token:
+        health_alert("portal_token", "⚠️ Portal token missing",
+                     "No placement-portal token found, so JAF tracking is PAUSED. Run 'python3 set_token.py'.")
+        return
+    exp = parse_jwt(token).get("exp")
+    if not exp:
+        return
+    hours_left = (exp - datetime.now(timezone.utc).timestamp()) / 3600
+    if hours_left <= 0:
+        health_alert("portal_token", "⚠️ Portal token expired",
+                     "Your placement-portal login token has expired, so JAF tracking, deadlines and "
+                     "reminders are PAUSED. Run 'python3 set_token.py' with a fresh token.")
+    elif hours_left <= TOKEN_WARN_HOURS and not os.path.exists(USER_DATA_DIR):
+        # (with chrome_data/ present, ensure_jwt_token() refreshes it automatically)
+        health_alert("portal_token", "⏳ Portal token expires soon",
+                     f"Your placement-portal token expires in ~{int(hours_left)}h. "
+                     "Refresh it with 'python3 set_token.py' to avoid missing alerts.")
+    else:
+        clear_health_alert("portal_token")
+
+def record_run(ok, jobs_count=None, errors=None):
+    state = load_json(HEALTH_STATE_FILE, {})
+    now = datetime.now(timezone.utc).isoformat()
+    state["last_run"] = now
+    if ok:
+        state["last_success"] = now
+        state["jobs_count"] = jobs_count
+    state["last_errors"] = errors or []
+    save_json(HEALTH_STATE_FILE, state)
+
+# ------------------------------------------------------------------ deadlines
+
+def check_deadlines(jobs):
+    """Daily digest of eligible-but-unsigned JAFs closing soon, plus a last-call
+    warning DEADLINE_WARN_HOURS before each one closes."""
+    if not jobs:
+        return
+    state = load_json(DEADLINE_STATE_FILE, {})
+    digest, warnings, new_state = compute_deadline_alerts(
+        jobs, state, datetime.now(timezone.utc),
+        warn_hours=DEADLINE_WARN_HOURS,
+        digest_hour=DEADLINE_DIGEST_HOUR,
+        digest_window_hours=DEADLINE_DIGEST_WINDOW_HOURS)
+
+    if digest:
+        send_notifications(
+            f"📅 {len(digest)} eligible JAF(s) closing in the next {DEADLINE_DIGEST_WINDOW_HOURS}h",
+            format_deadline_items(digest) + "\n\nYou haven't signed these yet.",
+            DISCORD_WEBHOOK_DEADLINES, color=3447003)
+    elif digest is not None:
+        print("[*] Deadline digest: nothing eligible closing soon.")
+
+    if warnings:
+        send_notifications(
+            f"🚨 Last call: {len(warnings)} JAF(s) close within {DEADLINE_WARN_HOURS}h",
+            format_deadline_items(warnings) + "\n\nSign now if you want to apply!",
+            DISCORD_WEBHOOK_DEADLINES, color=15158332)
+
+    save_json(DEADLINE_STATE_FILE, new_state)
+
+# ------------------------------------------------------------------ calendar
+
+def export_calendar(jobs):
+    """Writes placements.ics: deadlines for eligible unsigned JAFs + tests for signed JAFs."""
+    tests = load_json(TESTS_FILE, [])
+    signed_map = {j["id"]: j["company"] for j in jobs if j.get("signed") == "Yes"}
+    events = placement_events(jobs, tests, lambda t: test_is_for_signed_job(t, signed_map))
+    with open(CALENDAR_FILE, "w", newline="") as f:
+        f.write(build_ics(events))
+    print(f"[+] Calendar written: {CALENDAR_FILE} ({len(events)} events)")
+
+# ------------------------------------------------------------------ webhooks
+
+def configured_webhooks():
+    return {
+        "DISCORD_WEBHOOK_URL (generic / fallback)": DISCORD_WEBHOOK_URL,
+        "DISCORD_WEBHOOK_NEW_JAFS": DISCORD_WEBHOOK_NEW_JAFS,
+        "DISCORD_WEBHOOK_TESTS": DISCORD_WEBHOOK_TESTS,
+        "DISCORD_WEBHOOK_REMINDERS": DISCORD_WEBHOOK_REMINDERS,
+        "DISCORD_WEBHOOK_DEADLINES": DISCORD_WEBHOOK_DEADLINES,
+        "DISCORD_WEBHOOK_BLOG": DISCORD_WEBHOOK_BLOG,
+        "DISCORD_WEBHOOK_ALERTS": DISCORD_WEBHOOK_ALERTS,
+    }
+
+def check_webhooks_cli():
+    """python3 scraper.py --check-webhooks : verifies every webhook WITHOUT posting a message."""
+    print("Checking Discord webhooks (no messages are sent)...\n")
+    results = {}
+    all_ok = True
+    for name, url in configured_webhooks().items():
+        if url not in results:
+            results[url] = check_webhook(url)
+        ok, detail = results[url]
+        fallback = "" if not url or os.getenv(name.split(" ")[0], "").strip() else "  [falls back]"
+        mark = "✓" if ok else ("-" if not url else "✗")
+        shown = mask_webhook(url) if url else ""
+        print(f" {mark} {name:<42} {detail} {shown}{fallback}")
+        if url and not ok:
+            all_ok = False
+    print("\nAll configured webhooks are working." if all_ok else
+          "\nSome webhooks are dead: create a new webhook in Discord (Edit Channel → Integrations → "
+          "Webhooks) and update config.env.")
+    return all_ok
+
+# ------------------------------------------------------------------ main loop
 
 def run_all():
     print("----------------------------------------------------------------")
     print(f"Running Placement Portal & Blog check at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}...")
     token = ensure_jwt_token()
+    errors = []
+    jobs = None
+
     try:
-        check_jobs(token)
+        check_token_health(token)
     except Exception as e:
+        print(f"[!] Error during token health check: {e}")
+    try:
+        jobs = check_jobs(token)
+    except Exception as e:
+        errors.append(f"jobs: {e}")
         print(f"[!] Error during job check: {e}")
     try:
         check_blog()
     except Exception as e:
+        errors.append(f"blog: {e}")
         print(f"[!] Error during blog check: {e}")
     try:
         check_reminders(token)
     except Exception as e:
+        errors.append(f"reminders: {e}")
         print(f"[!] Error during reminder check: {e}")
     try:
         check_daily_closing_jafs()
     except Exception as e:
+        errors.append(f"daily closing: {e}")
         print(f"[!] Error during daily closing JAF check: {e}")
+    try:
+        check_deadlines(jobs)
+    except Exception as e:
+        errors.append(f"deadlines: {e}")
+        print(f"[!] Error during deadline check: {e}")
+    if jobs:
+        try:
+            export_calendar(jobs)
+        except Exception as e:
+            print(f"[!] Error writing calendar: {e}")
+
+    record_run(ok=jobs is not None, jobs_count=len(jobs) if jobs else None, errors=errors)
     print("Check complete.")
     print("----------------------------------------------------------------")
 
@@ -1334,5 +1612,7 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "--backfill-all":
         days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
         backfill_forms_and_shortlists(days)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--check-webhooks":
+        sys.exit(0 if check_webhooks_cli() else 1)
     else:
         run_all()
