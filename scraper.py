@@ -1227,10 +1227,112 @@ def backfill_tests(days=2):
         json.dump(known_blogs, f, indent=2)
     print(f"[+] Delivered {delivered} test update(s).")
 
+def backfill_forms_and_shortlists(days=7):
+    """Delivers recent mandatory forms and shortlists to their Discord channels."""
+    print(f"[*] Backfilling forms & shortlists from the last {days} day(s)...")
+    session = get_insti_session()
+    if not session:
+        print("[!] InstiApp session missing.")
+        return
+    try:
+        posts = fetch_insti_posts(session, num=100)
+    except Exception as e:
+        print(f"[!] Error fetching InstiApp blog: {e}")
+        return
+
+    token = ensure_jwt_token()
+    my_roll = (parse_jwt(token).get("username") or "").upper() if token else ""
+    cutoff = datetime.now(IST_TZ) - timedelta(days=days)
+
+    known_forms = []
+    if os.path.exists(FORMS_FILE):
+        try:
+            with open(FORMS_FILE, "r") as f:
+                known_forms = json.load(f)
+        except Exception:
+            known_forms = []
+    known_form_links = {fm.get("link") for fm in known_forms}
+
+    delivered_forms = 0
+    delivered_shortlists = 0
+
+    for p in reversed(posts):
+        pub_cutoff = None
+        if p.get("published"):
+            try:
+                pub_cutoff = datetime.fromisoformat(p["published"].replace("Z", "+00:00")).astimezone(IST_TZ)
+            except Exception:
+                pub_cutoff = None
+        if pub_cutoff and pub_cutoff < cutoff:
+            continue
+
+        title = p["title"]
+        # Check Form
+        if FORM_TITLE_RE.search(title):
+            company, job_ids = match_job_for_test(title, token)
+            form_links = extract_form_links(p.get("content_html", ""), p["body"])
+            deadline_iso = parse_deadline(p["body"])
+            dl_str = "No deadline detected" if not deadline_iso \
+                else f"Deadline: {datetime.fromisoformat(deadline_iso).strftime('%d %b %Y, %I:%M %p IST')}"
+            links_str = "\n".join(f"🔗 Form Link: {fl}" for fl in form_links) if form_links else "🔗 Form Link: see post"
+            desc = f"**{title}**\n{dl_str}\n{links_str}\n\n[Open Blog Post]({p['link']})"
+
+            print(f"[+] Delivering Form: {title}")
+            send_discord_embed(
+                DISCORD_WEBHOOK_FORMS,
+                f"📋 Mandatory Form: {company or title[:80]}",
+                desc,
+                color=15105570
+            )
+            delivered_forms += 1
+            if p["link"] not in known_form_links:
+                known_forms.append({
+                    "title": title,
+                    "link": p["link"],
+                    "company": company,
+                    "job_ids": job_ids,
+                    "deadline": deadline_iso,
+                    "form_links": form_links,
+                    "added_at": datetime.now(timezone.utc).isoformat(),
+                    "reminded_1h": False
+                })
+                known_form_links.add(p["link"])
+
+        # Check Shortlist
+        elif SHORTLIST_TITLE_RE.search(title):
+            company, job_ids = match_job_for_test(title, token)
+            external_links = extract_form_links(p.get("content_html", ""), p["body"])
+            links_str = "\n".join(f"🔗 External Link: {el}" for el in external_links) if external_links else ""
+            is_mentioned = my_roll and (my_roll in p["body"].upper())
+            status_badge = "🎉 **YOU ARE SHORTLISTED / MENTIONED IN THIS POST!**\n" if is_mentioned else ""
+
+            desc = f"{status_badge}**{title}**\n"
+            if links_str:
+                desc += f"{links_str}\n"
+            desc += f"\n[Open Blog Post]({p['link']})"
+
+            color = 3066993 if is_mentioned else 3447003
+            print(f"[+] Delivering Shortlist: {title}")
+            send_discord_embed(
+                DISCORD_WEBHOOK_SHORTLISTS,
+                f"🎯 Shortlist: {company or title[:80]}",
+                desc,
+                color=color
+            )
+            delivered_shortlists += 1
+
+    with open(FORMS_FILE, "w") as f:
+        json.dump(known_forms, f, indent=2)
+
+    print(f"[✓] Delivered {delivered_forms} form(s) and {delivered_shortlists} shortlist(s).")
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--backfill":
         days = int(sys.argv[2]) if len(sys.argv) > 2 else 2
         backfill_tests(days)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--backfill-all":
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+        backfill_forms_and_shortlists(days)
     else:
         run_all()
