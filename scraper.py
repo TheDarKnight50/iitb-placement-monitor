@@ -531,6 +531,7 @@ def check_jobs(token=None):
 
 TEST_TITLE_RE = re.compile(r"\b(test|aptitude|assessment|coding\s+round|online\s+test)\b", re.I)
 FORM_TITLE_RE = re.compile(r"\b(mandatory\s+form|preference\s+form|google\s+form|fill\s+the\s+form|mandatory.*form)\b", re.I)
+SHORTLIST_TITLE_RE = re.compile(r"\b(shortlist|short-list|waitlist|wait-list)\b", re.I)
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 MONTHS_MAP = {m[:3].lower(): i for i, m in enumerate(
     ["January", "February", "March", "April", "May", "June", "July",
@@ -773,9 +774,11 @@ def check_blog():
 
     if new_blogs:
         form_posts = [p for p in new_blogs if FORM_TITLE_RE.search(p["title"])]
-        remaining = [p for p in new_blogs if p not in form_posts]
-        test_posts = [p for p in remaining if TEST_TITLE_RE.search(p["title"] + "\n" + p["body"])]
-        other_posts = [p for p in remaining if p not in test_posts]
+        rem1 = [p for p in new_blogs if p not in form_posts]
+        shortlist_posts = [p for p in rem1 if SHORTLIST_TITLE_RE.search(p["title"])]
+        rem2 = [p for p in rem1 if p not in shortlist_posts]
+        test_posts = [p for p in rem2 if TEST_TITLE_RE.search(p["title"] + "\n" + p["body"])]
+        other_posts = [p for p in rem2 if p not in test_posts]
 
         token = ensure_jwt_token()
 
@@ -819,6 +822,32 @@ def check_blog():
 
             with open(FORMS_FILE, "w") as f:
                 json.dump(known_forms, f, indent=2)
+
+        if shortlist_posts:
+            # Check applicant roll number if token available
+            my_roll = (parse_jwt(token).get("username") or "").upper() if token else ""
+            for sp in shortlist_posts:
+                company, job_ids = match_job_for_test(sp["title"], token)
+                external_links = extract_form_links(sp.get("content_html", ""), sp["body"])
+                links_str = "\n".join(f"🔗 External Link: {el}" for el in external_links) if external_links else ""
+                
+                # Check if user's roll number is mentioned in the post body
+                is_mentioned = my_roll and (my_roll in sp["body"].upper())
+                status_badge = "🎉 **YOU ARE SHORTLISTED / MENTIONED IN THIS POST!**\n" if is_mentioned else ""
+
+                desc = f"{status_badge}**{sp['title']}**\n"
+                if links_str:
+                    desc += f"{links_str}\n"
+                desc += f"\n[Open Blog Post]({sp['link']})"
+
+                color = 3066993 if is_mentioned else 3447003  # Green if selected, blue otherwise
+                print(f"[+] Shortlist update: {sp['title']}")
+                send_discord_embed(
+                    DISCORD_WEBHOOK_SHORTLISTS,
+                    f"🎯 Shortlist: {company or sp['title'][:80]}",
+                    desc,
+                    color=color
+                )
 
         if test_posts:
             known_tests = []
