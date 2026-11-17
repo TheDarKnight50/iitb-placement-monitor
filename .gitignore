@@ -11,6 +11,7 @@ known_jobs.json
 known_blogs.json
 tests.json
 forms.json
+.daily_closing_state
 monitor.log
 chrome_data/
 __pycache__/

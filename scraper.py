@@ -44,6 +44,7 @@ BLOG_API = "https://gymkhana.iitb.ac.in/instiapp/api/placement-blog"
 INSTI_TOKEN_FILE = os.path.join(BASE_DIR, "insti_token.txt")
 TESTS_FILE = os.path.join(BASE_DIR, "tests.json")
 FORMS_FILE = os.path.join(BASE_DIR, "forms.json")
+DAILY_CLOSING_STATE_FILE = os.path.join(BASE_DIR, ".daily_closing_state")
 
 # Cache currency conversion rates to INR
 RATES_TO_INR = {
@@ -332,6 +333,7 @@ def fetch_jobs_data(token):
             "ctc": ctc_str,
             "last_day": last_day_str,
             "opens_at": j.get("opensAt", ""),
+            "closes_at": j.get("closesAt", ""),
             "signed_at": signed_at_time,
             "eligible": "Eligible" if is_eligible else "Not Eligible",
             "signed": "Yes" if has_signed else "No",
@@ -1048,6 +1050,84 @@ def check_reminders(token):
             with open(FORMS_FILE, "w") as f:
                 json.dump(forms, f, indent=2)
 
+def check_daily_closing_jafs():
+    """Every day at 11 PM IST, sends a summary reminder for all JAFs closing today."""
+    now_ist = datetime.now(IST_TZ)
+    today_str = now_ist.strftime("%Y-%m-%d")
+
+    # Only fire during the 11 PM hour (23:00 to 23:59 IST)
+    if now_ist.hour != 23:
+        return
+
+    # Check if we already alerted today
+    if os.path.exists(DAILY_CLOSING_STATE_FILE):
+        try:
+            with open(DAILY_CLOSING_STATE_FILE, "r") as f:
+                if f.read().strip() == today_str:
+                    return
+        except Exception:
+            pass
+
+    if not os.path.exists(KNOWN_JOBS_FILE):
+        return
+
+    try:
+        with open(KNOWN_JOBS_FILE, "r") as f:
+            known_jobs = json.load(f)
+    except Exception:
+        return
+
+    # Find jobs whose deadline is today (by closes_at or last_day string)
+    today_day_str = f"{now_ist.day}th {now_ist.strftime('%b')}"
+    if now_ist.day in (1, 21, 31):
+        today_day_str = f"{now_ist.day}st {now_ist.strftime('%b')}"
+    elif now_ist.day in (2, 22):
+        today_day_str = f"{now_ist.day}nd {now_ist.strftime('%b')}"
+    elif now_ist.day in (3, 23):
+        today_day_str = f"{now_ist.day}rd {now_ist.strftime('%b')}"
+
+    closing_today = []
+    for j in known_jobs.values():
+        closes_at = j.get("closes_at")
+        matched = False
+        if closes_at:
+            try:
+                c_dt = datetime.fromisoformat(closes_at.replace("Z", "+00:00")).astimezone(IST_TZ)
+                if c_dt.strftime("%Y-%m-%d") == today_str:
+                    matched = True
+            except Exception:
+                pass
+        if not matched and j.get("last_day"):
+            if today_day_str.lower() in j["last_day"].lower():
+                matched = True
+
+        if matched:
+            closing_today.append(j)
+
+    if not closing_today:
+        print("[*] No JAFs closing today at 11 PM check.")
+        with open(DAILY_CLOSING_STATE_FILE, "w") as f:
+            f.write(today_str)
+        return
+
+    # Split into eligible vs not eligible or signed
+    msg = f"⏳ **{len(closing_today)} JAF(s) are closing TONIGHT ({now_ist.strftime('%d %b %Y')})!**\n\n"
+    for cj in closing_today:
+        signed_badge = "✅ Signed" if cj.get("signed") == "Yes" else "❌ Not Signed"
+        elig_badge = cj.get("eligible", "Unknown")
+        msg += f"• **{cj['company']}** - {cj['role']}\n  CTC: {cj.get('ctc', 'N/A')} | [{elig_badge}] | [{signed_badge}]\n"
+
+    print(f"[+] Sending 11 PM daily reminder for {len(closing_today)} JAF(s) closing today.")
+    send_notifications(
+        "⏳ JAFs Closing Tonight Reminder (11 PM)",
+        msg,
+        DISCORD_WEBHOOK_REMINDERS,
+        color=15158332
+    )
+
+    with open(DAILY_CLOSING_STATE_FILE, "w") as f:
+        f.write(today_str)
+
 def run_all():
     print("----------------------------------------------------------------")
     print(f"Running Placement Portal & Blog check at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}...")
@@ -1064,6 +1144,10 @@ def run_all():
         check_reminders(token)
     except Exception as e:
         print(f"[!] Error during reminder check: {e}")
+    try:
+        check_daily_closing_jafs()
+    except Exception as e:
+        print(f"[!] Error during daily closing JAF check: {e}")
     print("Check complete.")
     print("----------------------------------------------------------------")
 
