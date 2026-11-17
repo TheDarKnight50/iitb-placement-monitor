@@ -125,9 +125,9 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 
 ### 4c. Discord Channel Webhooks (Optional)
 
-For per-channel routing (`new-jafs`, `tests`, `reminders`), create one webhook per channel
+For per-channel routing (`new-jafs`, `tests`, `reminders`, `forms`, `shortlists`), create one webhook per channel
 (*Edit Channel → Integrations → Webhooks → New Webhook → Copy URL*) and fill in
-`DISCORD_WEBHOOK_NEW_JAFS`, `DISCORD_WEBHOOK_TESTS` and `DISCORD_WEBHOOK_REMINDERS` in `config.env`.
+`DISCORD_WEBHOOK_NEW_JAFS`, `DISCORD_WEBHOOK_TESTS`, `DISCORD_WEBHOOK_REMINDERS`, `DISCORD_WEBHOOK_FORMS` and `DISCORD_WEBHOOK_SHORTLISTS` in `config.env`.
 Any missing webhook falls back to the generic `DISCORD_WEBHOOK_URL`.
 
 ---
